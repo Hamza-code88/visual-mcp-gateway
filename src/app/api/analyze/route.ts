@@ -1,9 +1,12 @@
 import { NextResponse } from 'next/server';
 import Groq from 'groq-sdk';
 import { executeQuery } from '@/lib/neo4j';
+import { groqChat } from '@/lib/groq-model';
 
 const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
+  // Dummy fallback so the module loads (and the build passes) without a key;
+  // real calls fail with a clear auth error instead of crashing the build.
+  apiKey: process.env.GROQ_API_KEY || 'dummy_groq_key',
 });
 
 export async function POST(request: Request) {
@@ -14,8 +17,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Competitor data is required' }, { status: 400 });
     }
 
-    // Use Llama 3 on Groq for ultra-fast keyword extraction and analysis
-    const chatCompletion = await groq.chat.completions.create({
+    // Use Groq for ultra-fast keyword extraction and analysis
+    const chatCompletion = await groqChat(groq, {
       messages: [
         {
           role: 'system',
@@ -26,7 +29,6 @@ export async function POST(request: Request) {
           content: JSON.stringify(competitorData),
         },
       ],
-      model: 'llama3-8b-8192',
       response_format: { type: 'json_object' },
     });
 

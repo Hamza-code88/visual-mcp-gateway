@@ -24,7 +24,7 @@ async function testKeys() {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const groqRes = await groq.chat.completions.create({
       messages: [{ role: 'user', content: 'Say exactly: "Groq is working perfectly!"' }],
-      model: 'llama-3.1-8b-instant',
+      model: 'openai/gpt-oss-120b',
     });
     console.log("✅ Groq Success! Response:", groqRes.choices[0]?.message?.content);
   } catch (e) {

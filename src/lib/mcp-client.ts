@@ -1,6 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 // Mapping of our logical servers to their potential actual SSE URLs
 const serverUrls: Record<string, string> = {
@@ -10,6 +9,7 @@ const serverUrls: Record<string, string> = {
 };
 
 import Groq from 'groq-sdk';
+import { groqChat, cleanGroqErrorMessage } from './groq-model';
 import { isCustomToolServer, getCustomToolsSchema, executeCustomTool } from './custom-tools';
 
 export async function executeMcpTool(serverType: string, prompt: string, githubToken?: string): Promise<string> {
@@ -19,16 +19,9 @@ export async function executeMcpTool(serverType: string, prompt: string, githubT
   // Resolve the best token to use (client-provided UI token, or fallback to server .env)
   const resolvedGithubToken = githubToken || process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
 
-  if (serverType === 'github') {
-    transport = new StdioClientTransport({
-      command: "node",
-      args: ["./node_modules/@modelcontextprotocol/server-github/dist/index.js"],
-      env: {
-        ...process.env,
-        GITHUB_PERSONAL_ACCESS_TOKEN: resolvedGithubToken || ""
-      }
-    });
-  } else if (!isCustom) {
+  // GitHub is a custom tool (direct GitHub REST API) — see custom-tools.ts.
+  // No stdio/SSE transport is needed for custom servers.
+  if (!isCustom) {
     const url = serverUrls[serverType];
     if (!url) {
       throw new Error(`No server configured for type: ${serverType}`);
@@ -52,7 +45,8 @@ export async function executeMcpTool(serverType: string, prompt: string, githubT
       }));
     } else {
       // Attempt to connect to the actual MCP Server
-      await client.connect(transport);
+      // (transport is always assigned here: github uses stdio, others use SSE)
+      await client.connect(transport!);
       
       // Fetch available tools from the MCP server
       const result = await client.listTools();
@@ -74,7 +68,7 @@ export async function executeMcpTool(serverType: string, prompt: string, githubT
       }
     }));
 
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || 'dummy_groq_key' });
     let additionalContext = "";
 
     // If it's GitHub, fetch the authenticated user's details so the LLM knows who "I" am!
@@ -102,8 +96,7 @@ CRITICAL RULE 5: You are explicitly AUTHORIZED to scrape, fetch, and read web pa
     let runner;
     try {
       // Step 1: Call Groq with the user's prompt and available tools
-      runner = await groq.chat.completions.create({
-        model: "llama-3.1-8b-instant",
+      runner = await groqChat(groq, {
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: prompt }
@@ -119,7 +112,7 @@ CRITICAL RULE 5: You are explicitly AUTHORIZED to scrape, fetch, and read web pa
       if (groqError.status === 400 && groqError.error?.error?.code === 'tool_use_failed') {
         return "Bhai aap ne poori details nahi di ya AI model ne ghalat parameters assume kar liye. Please apna prompt thora detail se likhein.";
       }
-      throw new Error(`Groq LLM Error: ${groqError.message}`);
+      throw new Error(`Groq LLM Error: ${cleanGroqErrorMessage(groqError)}`);
     }
 
     const responseMessage = runner.choices[0]?.message;
@@ -146,16 +139,15 @@ CRITICAL RULE 5: You are explicitly AUTHORIZED to scrape, fetch, and read web pa
       }
 
       // Step 3: Call Groq again with the tool's result to synthesize the final answer
-      const finalRes = await groq.chat.completions.create({
-        model: "llama-3.1-8b-instant",
+      const finalRes = await groqChat(groq, {
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: prompt },
           responseMessage as any,
-          { 
-            role: "tool", 
-            tool_call_id: toolCall.id, 
-            content: JSON.stringify(mcpResult.content) 
+          {
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(mcpResult.content)
           }
         ],
         temperature: 0.7

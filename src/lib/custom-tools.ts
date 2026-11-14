@@ -2,10 +2,73 @@ import neo4j from 'neo4j-driver';
 import axios from 'axios';
 
 export const isCustomToolServer = (serverType: string) => {
-  return ['neo4j', 'brightdata', 'algolia'].includes(serverType);
+  // GitHub is a custom tool too: it talks to the GitHub REST API directly.
+  // The old stdio MCP server (spawning a local node process) cannot work on
+  // Vercel serverless — the server file is not in the function bundle.
+  return ['github', 'neo4j', 'brightdata', 'algolia'].includes(serverType);
 };
 
 export const getCustomToolsSchema = (serverType: string) => {
+  if (serverType === 'github') {
+    return [
+      {
+        type: "function",
+        function: {
+          name: "search_repositories",
+          description: "Search GitHub repositories by keyword. Use query 'user:<username> sort:updated' to find a user's most recent repositories.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "The search query (e.g., 'user:Hamza-code88 sort:updated' or 'mcp gateway').",
+              },
+            },
+            required: ["query"],
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "list_user_repos",
+          description: "List a GitHub user's repositories, most recently updated first.",
+          parameters: {
+            type: "object",
+            properties: {
+              username: {
+                type: "string",
+                description: "The GitHub username.",
+              },
+            },
+            required: ["username"],
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "get_repository",
+          description: "Get details of one GitHub repository.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "The repository owner (username or org).",
+              },
+              repo: {
+                type: "string",
+                description: "The repository name.",
+              },
+            },
+            required: ["owner", "repo"],
+          },
+        },
+      }
+    ];
+  }
+
   if (serverType === 'neo4j') {
     return [
       {
@@ -76,6 +139,56 @@ export const getCustomToolsSchema = (serverType: string) => {
 };
 
 export const executeCustomTool = async (serverType: string, functionName: string, args: any, token: string) => {
+  if (serverType === 'github') {
+    const headers: Record<string, string> = {
+      'User-Agent': 'Visual-MCP',
+      'Accept': 'application/vnd.github+json',
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const ghFetch = async (url: string) => {
+      const res = await fetch(url, { headers });
+      if (res.status === 401) throw new Error('GitHub token invalid or expired. Please check the token in Settings.');
+      if (res.status === 403) {
+        const remaining = res.headers.get('x-ratelimit-remaining');
+        if (remaining === '0') throw new Error('GitHub API rate limit exceeded. Please try again later.');
+        throw new Error('GitHub API access forbidden. Check the token scope (needs repo access).');
+      }
+      if (res.status === 404) throw new Error('GitHub resource not found. Check the owner/repo name.');
+      if (!res.ok) throw new Error(`GitHub API error ${res.status}`);
+      return res.json();
+    };
+
+    const summarizeRepo = (r: any) => ({
+      name: r.full_name,
+      description: r.description,
+      stars: r.stargazers_count,
+      language: r.language,
+      url: r.html_url,
+      updated: r.updated_at,
+    });
+
+    if (functionName === 'search_repositories') {
+      if (!args.query) throw new Error('Search query is required');
+      const data = await ghFetch(`https://api.github.com/search/repositories?q=${encodeURIComponent(args.query)}&sort=updated&per_page=5`);
+      return { content: (data.items || []).map(summarizeRepo) };
+    }
+
+    if (functionName === 'list_user_repos') {
+      if (!args.username) throw new Error('Username is required');
+      const data = await ghFetch(`https://api.github.com/users/${encodeURIComponent(args.username)}/repos?sort=updated&per_page=10`);
+      return { content: (Array.isArray(data) ? data : []).map(summarizeRepo) };
+    }
+
+    if (functionName === 'get_repository') {
+      if (!args.owner || !args.repo) throw new Error('Owner and repo are required');
+      const data = await ghFetch(`https://api.github.com/repos/${encodeURIComponent(args.owner)}/${encodeURIComponent(args.repo)}`);
+      return { content: summarizeRepo(data) };
+    }
+
+    throw new Error('Unknown function');
+  }
+
   if (serverType === 'neo4j') {
     if (functionName !== 'execute_cypher_query') throw new Error('Unknown function');
     
@@ -104,22 +217,8 @@ export const executeCustomTool = async (serverType: string, functionName: string
       });
       return { content: records };
     } catch (e: any) {
-      console.log('Neo4j connection failed, using fallback.', e.message);
-      // Hackathon Fallback: If DB is not connected, provide dummy graph data
-      return { 
-        content: [
-          {
-            "User": { "name": "User A", "role": "Developer" },
-            "Relationship": "WORKS_ON",
-            "Project": { "name": "Project B", "status": "Active", "tech": "Next.js" }
-          },
-          {
-            "User": { "name": "User A", "role": "Developer" },
-            "Relationship": "MANAGES",
-            "Project": { "name": "Project C", "status": "Planning", "tech": "Neo4j" }
-          }
-        ] 
-      };
+      // No dummy fallback: never present fake graph data as a real result.
+      throw new Error(`Neo4j query failed: ${e.message}`);
     } finally {
       await session.close();
       await driver.close();
@@ -175,7 +274,7 @@ export const executeCustomTool = async (serverType: string, functionName: string
 
     if (!appId || !apiKey) throw new Error('Invalid Algolia Token format. Expected APP_ID:API_KEY');
 
-    const indexName = 'system_logs';
+    const indexName = 'algolia-system-logs';
     
     try {
       // Build standard REST payload
@@ -197,25 +296,8 @@ export const executeCustomTool = async (serverType: string, functionName: string
       }
 
       const data = await res.json();
-      let hits = data.hits || [];
-
-      // Hackathon Demo Fallback: If index is empty or syncing, provide realistic dummy logs
-      if (hits.length === 0) {
-        hits = [
-          {
-            status: 500,
-            message: "Database connection failed due to timeout",
-            timestamp: new Date().toISOString()
-          },
-          {
-            status: 404,
-            message: "User not found in system",
-            timestamp: new Date(Date.now() - 3600000).toISOString()
-          }
-        ];
-      }
-
-      return { content: hits };
+      // No dummy fallback: an empty index honestly returns no hits.
+      return { content: data.hits || [] };
     } catch (e: any) {
       throw new Error(`Algolia Search Failed: ${e.message}`);
     }

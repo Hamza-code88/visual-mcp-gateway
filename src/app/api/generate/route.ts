@@ -24,7 +24,7 @@ export async function POST(request: Request) {
     const prompt = `Generate a highly optimized local SEO blog post for a ${businessContext.niche} in ${businessContext.location}. Target keywords: ${targetKeywords.join(', ')}. Return clean markdown.`;
     
     const response = await ai.models.generateContent({
-        model: 'gemini-1.5-flash',
+        model: 'gemini-2.5-flash',
         contents: prompt,
     });
     
